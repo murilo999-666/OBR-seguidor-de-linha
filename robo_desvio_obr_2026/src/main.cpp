@@ -116,13 +116,18 @@ const uint8_t VEL_CURVA  = 220;
 // Tempos do contorno em U (ajuste conforme velocidade e piso)
 const int T_LATERAL = 1750;              // ms — avanço lateral (ida e volta)
 const int T_FRENTE  = 3100;             // ms — avanço frontal (passa o obstáculo)
-const int T_RETORNO = T_LATERAL + 1000;  // ms — último lateral; +500 ms para garantir retorno à linha
+const int T_RETORNO = T_LATERAL + 400;  // ms — último lateral; +500 ms para garantir retorno à linha
 
 // Compensação de inércia nas curvas: motores param COMP_ANGULO° antes do alvo
 // para que o deslizamento residual complete o ângulo. Aumente se ainda girar
 // demais, reduza se ficar curto.
 const float COMP_ANGULO        = 12.0f;
-const float COMP_ANGULO_2CURVA =  9.0f;  // 2ª curva (crítica): margem menor → erra levemente para mais
+const float COMP_ANGULO_2CURVA =  9.0f;  // 2ª curva (crítica): obsoleto — substituído por COMP_ANGULO_CRITICA
+
+// Curva crítica (curva 3 do desvio): velocidade reduzida + comp mínima
+// → motores giram quase o ângulo completo; inércia residual empurra levemente além → erra para mais
+const uint8_t VEL_CURVA_CRITICA   = 185;
+const float   COMP_ANGULO_CRITICA =  3.0f;
 
 // ─────────────────────────────────────────────────────────────
 //  SEÇÃO 4 — TIPOS E VARIÁVEIS GLOBAIS
@@ -371,10 +376,11 @@ void desviarObstaculo() {
   aguardar(450);
 
   // 3 — Curva 90° à esquerda (retoma direção original) — CURVA CRÍTICA
-  //     Settle maior + comp menor: erra levemente para mais se errar
-  aguardar(300);  // acomodação extra antes de amostrar offset
-  girarAngulo(-90.0f, VEL_CURVA, COMP_ANGULO_2CURVA);
-  aguardar(450);
+  //     Vel. reduzida + comp mínima: motores cobrem quase todo o ângulo;
+  //     inércia residual empurra ≥90° → se errar, erra para mais.
+  aguardar(400);  // acomodação extra antes de amostrar offset
+  girarAngulo(-90.0f, VEL_CURVA_CRITICA, COMP_ANGULO_CRITICA);
+  aguardar(500);
 
   // 4 — Avança à frente (ultrapassa o comprimento do obstáculo)
   moverFrente(VEL_NORMAL);
