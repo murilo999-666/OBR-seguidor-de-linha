@@ -116,7 +116,7 @@ const uint8_t VEL_CURVA  = 220;
 // Tempos do contorno em U (ajuste conforme velocidade e piso)
 const int T_LATERAL = 1750;              // ms — avanço lateral (ida e volta)
 const int T_FRENTE  = 3100;             // ms — avanço frontal (passa o obstáculo)
-const int T_RETORNO = T_LATERAL + 400;  // ms — último lateral; +500 ms para garantir retorno à linha
+const int T_RETORNO = T_LATERAL + 0;  // ms — último lateral; +500 ms para garantir retorno à linha
 
 // Compensação de inércia nas curvas: motores param COMP_ANGULO° antes do alvo
 // para que o deslizamento residual complete o ângulo. Aumente se ainda girar
