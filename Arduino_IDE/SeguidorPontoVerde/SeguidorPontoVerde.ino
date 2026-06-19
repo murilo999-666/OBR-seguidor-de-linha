@@ -1,7 +1,50 @@
 /*
+ * ════════════════════════════════════════════════════════════════════════
+ *  >>> VERSÃO ARDUINO IDE  —  COMO COMPILAR E ENVIAR  <<<
+ * ════════════════════════════════════════════════════════════════════════
+ *
+ *  Este é o MESMO programa da versão PlatformIO, adaptado para a Arduino IDE.
+ *  A pasta precisa se chamar "SeguidorPontoVerde" e o arquivo
+ *  "SeguidorPontoVerde.ino" (a Arduino IDE exige pasta = nome do .ino).
+ *
+ *  1) SUPORTE A PLACA ESP32 (Boards Manager)
+ *     - Arquivo > Preferencias > "URLs Adicionais de Gerenciadores de Placas":
+ *         https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+ *     - Ferramentas > Placa > Gerenciador de Placas... > procure "esp32"
+ *       e instale "esp32 by Espressif Systems" (3.x recomendado; compila no 2.x tambem).
+ *     - Selecione: Ferramentas > Placa > ESP32 Arduino > "DOIT ESP32 DEVKIT V1".
+ *
+ *  2) BIBLIOTECAS (Ferramentas > Gerenciar Bibliotecas / Library Manager)
+ *     Instale estas tres (as outras ja vem no core do ESP32):
+ *       - "QTRSensors"         by Pololu           (sensores de linha)
+ *       - "MPU6050"            by Electronic Cats  (giroscopio)
+ *       - "Adafruit TCS34725"  by Adafruit         (sensores de cor)
+ *           -> aceite instalar a dependencia "Adafruit BusIO" quando pedir.
+ *     Ja incluidas no core do ESP32 (NAO precisa instalar):
+ *       - Wire        (I2C - usa dois barramentos: Wire e Wire1)
+ *       - Preferences (NVS - salva a calibracao na flash interna)
+ *
+ *  3) CONFIGURACAO DA IDE
+ *     - Velocidade do Monitor Serial: 115200 baud.
+ *     - Upload Speed: 921600 (use 115200 se der erro de gravacao).
+ *     - Partition Scheme: padrao ("Default 4MB with spiffs") basta.
+ *
+ *  4) PRIMEIRO USO
+ *     - Ao ligar: calibra o QTR (mova sobre a linha) e o giroscopio (parado
+ *       nos 3 bips). Calibracao de QTR e cor ficam salvas na flash (NVS).
+ *     - Calibre as cores 1x pelo Monitor Serial: coloque os DOIS sensores
+ *       sobre cada cor e envie 'p' (preto), 'b' (branco), 'g' (verde).
+ *       Confira com 'v'. Lista completa de comandos no cabecalho abaixo.
+ *
+ *  Comportamento IDENTICO a versao PlatformIO; muda so a instalacao.
+ *  Pasta PlatformIO equivalente: ../../seguidor_ponto_verde_esp32/
+ * ════════════════════════════════════════════════════════════════════════
+ */
+
+/*
  * ════════════════════════════════════════════════════════════════
  *  SEGUIDOR DE LINHA + PONTO VERDE — OBR 2026 Nível 2
- *  ESP32 / PlatformIO
+ *  ESP32 / Arduino IDE
  *
  *  Baseado em:
  *   • seguidor_de_linha_PID_esp32  (QTRSensors analógico + PID)
@@ -37,11 +80,21 @@
  *   5. Reencontra a linha avançando devagar → retoma PID
  *
  *  COMANDOS SERIAL (115200 baud):
- *   p  = captura CLEAR atual como PRETO   (sensor sobre linha preta)
- *   b  = captura CLEAR atual como BRANCO  (sensor sobre piso branco)
- *   v  = imprime razões sobre VERDE       (sensor sobre marcador verde)
+ *   p  = captura RGB atual como PRETO     (sensor sobre linha preta)
+ *   b  = captura RGB atual como BRANCO    (sensor sobre piso branco)
+ *   g  = captura RGB atual como VERDE     (sensor sobre marcador verde)
+ *   v  = imprime RGB lido + classificação (verde / não-verde)
+ *   k  = recalibra o QTR ao vivo e salva
+ *   z  = apaga toda a calibração da NVS
  *   c  = imprime calibração atual
  *   i  = imprime estado atual (debug)
+ *
+ *  CLASSIFICAÇÃO DE COR: vizinho mais próximo em CROMATICIDADE
+ *   (RGB normalizado por R+G+B — independe do brilho). A cor lida é
+ *   comparada com as 3 referências do sensor (preto/branco/verde) e
+ *   vence a mais próxima; é verde quando a referência VERDE vence.
+ *   Normalizar evita a falsa leitura de verde na transição branco→preto
+ *   (onde os valores brutos passam pelo "médio" parecido com o verde).
  * ════════════════════════════════════════════════════════════════
  */
 
@@ -49,6 +102,7 @@
 #include <Wire.h>
 #include <QTRSensors.h>
 #include <MPU6050.h>
+#include <Preferences.h>          // NVS — memória interna (calibração persistente)
 #include "Adafruit_TCS34725.h"
 
 // ─────────────────────────────────────────────────────────────
@@ -133,11 +187,23 @@ const float COMP_ANGULO  = 12.0f; // para ANTES do alvo (inércia); tunar igual 
 // --- Timeout reencontrar linha ---
 const uint32_t T_REENCONTR_MAX = 2000;
 
-// --- Calibração de cor TCS (ajustar via Serial p/b/v) ---
-uint16_t cPreto  = 300;
-uint16_t cBranco = 6000;
-float    GC_MIN  = 0.38f;
-const float MARGEM_REL = 1.10f;
+// --- Calibração de cor TCS (RGB) — calibrar via Serial p/b/g ---
+// Guardamos a referência RGB de cada cor e classificamos pela menor
+// distância em cromaticidade (vizinho mais próximo). São "3 valores por cor"
+// (R, G, B brutos do TCS34725).
+//
+// IMPORTANTE: os dois TCS têm escalas de leitura diferentes, então cada
+// sensor tem seu PRÓPRIO conjunto de referências (sufixo E = esquerdo,
+// D = direito). Sem isso, o preto de um sensor pode cair perto do verde
+// calibrado no outro e ser classificado como verde.
+struct RefCor { uint16_t r, g, b; };
+//                          R     G     B
+RefCor refPretoE  = {   30,   30,   30 };  // ESQ: linha/piso preto
+RefCor refBrancoE = { 2000, 2000, 2000 };  // ESQ: piso branco
+RefCor refVerdeE  = {  200,  600,  200 };  // ESQ: marcador verde
+RefCor refPretoD  = {   30,   30,   30 };  // DIR: linha/piso preto
+RefCor refBrancoD = { 2000, 2000, 2000 };  // DIR: piso branco
+RefCor refVerdeD  = {  200,  600,  200 };  // DIR: marcador verde
 
 // ─────────────────────────────────────────────────────────────
 //  SEÇÃO 4 — OBJETOS GLOBAIS
@@ -151,6 +217,10 @@ MPU6050 mpu;
 Adafruit_TCS34725 tcsE(TCS34725_INTEGRATIONTIME_50MS, TCS34725_GAIN_4X);
 Adafruit_TCS34725 tcsD(TCS34725_INTEGRATIONTIME_50MS, TCS34725_GAIN_4X);
 bool tcsEOk = false, tcsDOk = false;
+
+// NVS — calibração persistente (QTR + cor). MPU NÃO é salvo (recalibra no boot).
+Preferences prefs;
+const char *NVS_NS = "calib";      // namespace na flash interna
 
 // ─────────────────────────────────────────────────────────────
 //  SEÇÃO 5 — VARIÁVEIS DE ESTADO
@@ -173,6 +243,13 @@ unsigned long tEstado = 0;
 //  SEÇÃO 6 — PROTÓTIPOS
 // ─────────────────────────────────────────────────────────────
 void   calibrarQTR();
+void   calibrarQTRAoVivo();
+void   aplicarCalibracaoQTR(const uint16_t *mins, const uint16_t *maxs);
+bool   carregarCalibracaoQTR();
+void   salvarCalibracaoQTR();
+void   carregarCalibracaoCor();
+void   salvarCalibracaoCor();
+void   limparCalibracaoNVS();
 void   calibrarIMU();
 void   moverFrente(int vel);
 void   moverRe(int vel);
@@ -183,9 +260,9 @@ static void aguardar(unsigned long ms);
 void   pidLinha();
 int    contarPretosSV();
 bool   intersecaoDetectada();
-struct LeituraCor { float r=0,g=0,b=0; uint16_t c=0; };
+struct LeituraCor { uint16_t r=0, g=0, b=0, c=0; };
 LeituraCor lerCor(Adafruit_TCS34725 &tcs);
-bool   ehVerde(const LeituraCor &L);
+bool   ehVerde(const LeituraCor &L, const RefCor &rPreto, const RefCor &rBranco, const RefCor &rVerde);
 void   fsmUpdate();
 void   tratarSerial();
 void   bip(int n, int ms_on=100, int ms_off=80);
@@ -232,11 +309,15 @@ void setup() {
     if (tcsDOk) { tcsD.setInterrupt(false); Serial.println(F("[OK] TCS DIREITO")); }
     else          Serial.println(F("[--] TCS DIREITO ausente"));
 
-    // QTR — calibração automática (400 leituras; mover o robô sobre a linha)
+    // Calibração de cor: carrega da NVS (se já calibrada antes)
+    carregarCalibracaoCor();
+
+    // QTR — carrega da NVS se existir; senão calibra (400 leituras) e salva
     calibrarQTR();
 
     bip(3);
-    Serial.println(F("Pronto! Comandos: p=preto b=branco v=verde c=config i=debug"));
+    Serial.println(F("Pronto! Comandos: p=preto b=branco g=verde (capturam RGB)  v=ler RGB"));
+    Serial.println(F("                  k=recalibrar QTR  z=limpar NVS  c=config i=debug"));
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -256,6 +337,18 @@ void calibrarQTR() {
     qtr.setTypeAnalog();
     qtr.setSensorPins((const uint8_t[]){26, 27, 14, 12, 13}, NUM_SENS);
 
+    // Se já houver calibração salva na flash, usa ela e pula a calibração ao vivo.
+    if (carregarCalibracaoQTR()) {
+        Serial.println(F("[OK] Calibracao QTR carregada da NVS (envie 'k' p/ recalibrar)."));
+        bip(1);
+        return;
+    }
+    // Primeira vez (ou NVS limpa): calibra ao vivo e salva.
+    calibrarQTRAoVivo();
+}
+
+// Rotina de calibração ao vivo (400 leituras) — usada na 1ª vez e no comando 'k'.
+void calibrarQTRAoVivo() {
     Serial.println(F("Calibrando QTR (400 leituras)..."));
     Serial.println(F(">>> MOVA O ROBO SOBRE A LINHA PRETA AGORA <<<"));
     digitalWrite(PIN_LED, HIGH);
@@ -267,7 +360,84 @@ void calibrarQTR() {
 
     digitalWrite(PIN_LED, LOW);
     Serial.println(F("Calibracao QTR concluida."));
+    salvarCalibracaoQTR();
     bip(2);
+}
+
+// ── Persistência QTR (NVS) ──────────────────────────────────────
+// Aplica min/max lidos da flash diretamente no objeto QTRSensors.
+void aplicarCalibracaoQTR(const uint16_t *mins, const uint16_t *maxs) {
+    // Uma chamada a calibrate() força a alocação interna dos arrays
+    // calibrationOn.minimum/maximum (e marca initialized=true).
+    qtr.calibrate();
+    for (uint8_t i = 0; i < NUM_SENS; i++) {
+        qtr.calibrationOn.minimum[i] = mins[i];
+        qtr.calibrationOn.maximum[i] = maxs[i];
+    }
+}
+
+bool carregarCalibracaoQTR() {
+    prefs.begin(NVS_NS, true);                       // somente leitura
+    bool ok = prefs.getBool("qtr_ok", false);
+    if (ok) {
+        uint16_t mins[NUM_SENS], maxs[NUM_SENS];
+        prefs.getBytes("qtr_min", mins, sizeof(mins));
+        prefs.getBytes("qtr_max", maxs, sizeof(maxs));
+        prefs.end();
+        aplicarCalibracaoQTR(mins, maxs);
+        return true;
+    }
+    prefs.end();
+    return false;
+}
+
+void salvarCalibracaoQTR() {
+    if (!qtr.calibrationOn.initialized) return;
+    prefs.begin(NVS_NS, false);                      // leitura/escrita
+    prefs.putBytes("qtr_min", qtr.calibrationOn.minimum, sizeof(uint16_t) * NUM_SENS);
+    prefs.putBytes("qtr_max", qtr.calibrationOn.maximum, sizeof(uint16_t) * NUM_SENS);
+    prefs.putBool("qtr_ok", true);
+    prefs.end();
+    Serial.println(F("[NVS] Calibracao QTR salva."));
+}
+
+// ── Persistência de cor (NVS) ───────────────────────────────────
+void carregarCalibracaoCor() {
+    prefs.begin(NVS_NS, true);
+    // "cor_ok2" = esquema por sensor (6 referências). Ignora dados antigos.
+    if (prefs.getBool("cor_ok2", false)) {
+        prefs.getBytes("refPE", &refPretoE,  sizeof(refPretoE));
+        prefs.getBytes("refBE", &refBrancoE, sizeof(refBrancoE));
+        prefs.getBytes("refVE", &refVerdeE,  sizeof(refVerdeE));
+        prefs.getBytes("refPD", &refPretoD,  sizeof(refPretoD));
+        prefs.getBytes("refBD", &refBrancoD, sizeof(refBrancoD));
+        prefs.getBytes("refVD", &refVerdeD,  sizeof(refVerdeD));
+        Serial.println(F("[OK] Calibracao de cor (RGB por sensor) carregada da NVS."));
+    } else {
+        Serial.println(F("[--] Sem calibracao de cor — calibre com p/b/g (usando padroes)."));
+    }
+    prefs.end();
+}
+
+void salvarCalibracaoCor() {
+    prefs.begin(NVS_NS, false);
+    prefs.putBytes("refPE", &refPretoE,  sizeof(refPretoE));
+    prefs.putBytes("refBE", &refBrancoE, sizeof(refBrancoE));
+    prefs.putBytes("refVE", &refVerdeE,  sizeof(refVerdeE));
+    prefs.putBytes("refPD", &refPretoD,  sizeof(refPretoD));
+    prefs.putBytes("refBD", &refBrancoD, sizeof(refBrancoD));
+    prefs.putBytes("refVD", &refVerdeD,  sizeof(refVerdeD));
+    prefs.putBool ("cor_ok2", true);
+    prefs.end();
+    Serial.println(F("[NVS] Calibracao de cor (RGB por sensor) salva."));
+}
+
+// Apaga toda a calibração da flash (QTR + cor). Recalibra no próximo boot.
+void limparCalibracaoNVS() {
+    prefs.begin(NVS_NS, false);
+    prefs.clear();
+    prefs.end();
+    Serial.println(F("[NVS] Calibracao apagada. Reinicie para recalibrar."));
 }
 
 void calibrarIMU() {
@@ -359,6 +529,8 @@ static void aguardar(unsigned long ms) {
 
 // ════════════════════════════════════════════════════════════════
 //  PID DE LINHA (baseado no seguidor_de_linha_PID_esp32)
+//  DESATIVADO — mantido para reintegração futura do seguidor de linha.
+//  Para reativar: chame pidLinha() no estado SEGUINDO da fsmUpdate().
 // ════════════════════════════════════════════════════════════════
 void pidLinha() {
     uint16_t position = qtr.readLineBlack(sensorValues);
@@ -410,26 +582,37 @@ bool intersecaoDetectada() {
 // ════════════════════════════════════════════════════════════════
 LeituraCor lerCor(Adafruit_TCS34725 &tcs) {
     LeituraCor L;
-    uint16_t r, g, b, c;
-    tcs.getRawData(&r, &g, &b, &c);
-    L.c = c;
-    if (c == 0) return L;
-    L.r = (float)r / c;
-    L.g = (float)g / c;
-    L.b = (float)b / c;
+    // Lê diretamente os canais RGB brutos (+ clear) do TCS34725.
+    tcs.getRawData(&L.r, &L.g, &L.b, &L.c);
     return L;
 }
 
-bool ehVerde(const LeituraCor &L) {
-    // Descarta preto (C baixo) e branco/reflexo (C alto)
-    uint16_t cMin = cPreto + (cBranco - cPreto) / 5;
-    if (L.c < cMin)                        return false;
-    if (L.c > (uint16_t)(cBranco * 0.95f)) return false;
-    // Verde domina vermelho e azul por pelo menos MARGEM_REL
-    if (!(L.g > L.r * MARGEM_REL && L.g > L.b * MARGEM_REL)) return false;
-    // Razão g/c mínima
-    if (L.g < GC_MIN) return false;
-    return true;
+// Distância² em CROMATICIDADE (RGB normalizado por R+G+B), não em RGB bruto.
+// Por quê: no RGB bruto o verde tem valores MÉDIOS, e na transição
+// branco→preto os canais passam por valores médios também — então a
+// transição fica perto do verde e gera leitura falsa. Normalizando,
+// o brilho some: branco, preto e toda a transição ficam EQUILIBRADOS
+// (~1/3 em cada canal), enquanto o verde tem G dominante. Assim só o
+// verde de verdade se aproxima da referência verde.
+static float distCromSq(const LeituraCor &L, const RefCor &R) {
+    float sL = (float)L.r + L.g + L.b;
+    float sR = (float)R.r + R.g + R.b;
+    if (sL <= 0.0f || sR <= 0.0f) return 1e9f;     // sem luz: indefinido
+    float dr = (float)L.r / sL - (float)R.r / sR;
+    float dg = (float)L.g / sL - (float)R.g / sR;
+    float db = (float)L.b / sL - (float)R.b / sR;
+    return dr * dr + dg * dg + db * db;
+}
+
+// Classifica a leitura pelo vizinho mais próximo (em cromaticidade) entre
+// as 3 referências DAQUELE sensor. É verde quando a referência VERDE é a
+// mais próxima das três.
+bool ehVerde(const LeituraCor &L, const RefCor &rPreto, const RefCor &rBranco, const RefCor &rVerde) {
+    if (L.c == 0) return false;
+    float dPreto  = distCromSq(L, rPreto);
+    float dBranco = distCromSq(L, rBranco);
+    float dVerde  = distCromSq(L, rVerde);
+    return (dVerde < dPreto && dVerde < dBranco);
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -442,8 +625,8 @@ void fsmUpdate() {
     if (tcsDOk)  cD = lerCor(tcsD);
 
     if (estado == SEGUINDO) {
-        contE = (tcsEOk && ehVerde(cE)) ? contE + 1 : 0;
-        contD = (tcsDOk  && ehVerde(cD)) ? contD + 1 : 0;
+        contE = (tcsEOk && ehVerde(cE, refPretoE, refBrancoE, refVerdeE)) ? contE + 1 : 0;
+        contD = (tcsDOk  && ehVerde(cD, refPretoD, refBrancoD, refVerdeD)) ? contD + 1 : 0;
         if (contE >= N_HIST) latchE = true;
         if (contD >= N_HIST) latchD = true;
     }
@@ -463,7 +646,10 @@ void fsmUpdate() {
             estado  = VERDE_AVANCANDO;
             break;
         }
-        pidLinha();
+        // SEGUIDOR DE LINHA REMOVIDO — anda reto com os dois motores na mesma
+        // velocidade. Para reativar o PID, troque a linha abaixo por pidLinha()
+        // (a função continua definida e pronta para reintegração).
+        moverFrente(lfspeed);
         break;
 
     // ──────────────────────────────────────────────
@@ -561,37 +747,79 @@ void tratarSerial() {
     if (!Serial.available()) return;
     char cmd = Serial.read();
 
-    LeituraCor L;
-    if      (tcsEOk) L = lerCor(tcsE);
-    else if (tcsDOk) L = lerCor(tcsD);
-    else { Serial.println(F("[CAL] Nenhum TCS disponivel.")); return; }
+    // Comandos que não dependem do TCS
+    if (cmd == 'k') {                 // recalibrar QTR ao vivo e salvar na NVS
+        calibrarQTRAoVivo();
+        return;
+    }
+    if (cmd == 'z') {                 // apagar toda a calibração da NVS
+        limparCalibracaoNVS();
+        return;
+    }
+
+    if (!tcsEOk && !tcsDOk) { Serial.println(F("[CAL] Nenhum TCS disponivel.")); return; }
+
+    // Lê os dois sensores agora (ambos sobre a mesma cor durante a calibração)
+    LeituraCor cE, cD;
+    if (tcsEOk) cE = lerCor(tcsE);
+    if (tcsDOk) cD = lerCor(tcsD);
 
     switch (cmd) {
         case 'p':
-            cPreto = L.c;
-            Serial.print(F("[CAL] cPreto = ")); Serial.println(cPreto);
+            if (tcsEOk) refPretoE = { cE.r, cE.g, cE.b };
+            if (tcsDOk) refPretoD = { cD.r, cD.g, cD.b };
+            salvarCalibracaoCor();
+            Serial.print(F("[CAL] PRETO  ESQ="));
+            Serial.print(cE.r); Serial.print(','); Serial.print(cE.g); Serial.print(','); Serial.print(cE.b);
+            Serial.print(F("  DIR="));
+            Serial.print(cD.r); Serial.print(','); Serial.print(cD.g); Serial.print(','); Serial.println(cD.b);
             break;
         case 'b':
-            cBranco = L.c;
-            Serial.print(F("[CAL] cBranco = ")); Serial.println(cBranco);
+            if (tcsEOk) refBrancoE = { cE.r, cE.g, cE.b };
+            if (tcsDOk) refBrancoD = { cD.r, cD.g, cD.b };
+            salvarCalibracaoCor();
+            Serial.print(F("[CAL] BRANCO ESQ="));
+            Serial.print(cE.r); Serial.print(','); Serial.print(cE.g); Serial.print(','); Serial.print(cE.b);
+            Serial.print(F("  DIR="));
+            Serial.print(cD.r); Serial.print(','); Serial.print(cD.g); Serial.print(','); Serial.println(cD.b);
+            break;
+        case 'g':
+            if (tcsEOk) refVerdeE = { cE.r, cE.g, cE.b };
+            if (tcsDOk) refVerdeD = { cD.r, cD.g, cD.b };
+            salvarCalibracaoCor();
+            Serial.print(F("[CAL] VERDE  ESQ="));
+            Serial.print(cE.r); Serial.print(','); Serial.print(cE.g); Serial.print(','); Serial.print(cE.b);
+            Serial.print(F("  DIR="));
+            Serial.print(cD.r); Serial.print(','); Serial.print(cD.g); Serial.print(','); Serial.println(cD.b);
             break;
         case 'v':
-            Serial.print(F("[CAL] VERDE  r/c=")); Serial.print(L.r, 3);
-            Serial.print(F("  g/c="));            Serial.print(L.g, 3);
-            Serial.print(F("  b/c="));            Serial.print(L.b, 3);
-            Serial.print(F("  C="));              Serial.println(L.c);
-            Serial.println(F("       ^ ajuste GC_MIN um pouco abaixo do g/c acima"));
+            Serial.print(F("[CAL] ESQ="));
+            Serial.print(cE.r); Serial.print(','); Serial.print(cE.g); Serial.print(','); Serial.print(cE.b);
+            Serial.print(F(" C=")); Serial.print(cE.c);
+            Serial.print(tcsEOk && ehVerde(cE, refPretoE, refBrancoE, refVerdeE) ? F("[VERDE]") : F("[-]"));
+            Serial.print(F("   DIR="));
+            Serial.print(cD.r); Serial.print(','); Serial.print(cD.g); Serial.print(','); Serial.print(cD.b);
+            Serial.print(F(" C=")); Serial.print(cD.c);
+            Serial.println(tcsDOk && ehVerde(cD, refPretoD, refBrancoD, refVerdeD) ? F("[VERDE]") : F("[-]"));
             break;
         case 'c':
-            Serial.print(F("[CAL] cPreto="));    Serial.print(cPreto);
-            Serial.print(F("  cBranco="));       Serial.print(cBranco);
-            Serial.print(F("  GC_MIN="));        Serial.print(GC_MIN, 3);
-            Serial.print(F("  MARGEM="));        Serial.print(MARGEM_REL, 2);
-            Serial.print(F("  N_HIST="));        Serial.println(N_HIST);
-            Serial.print(F("  Kp="));            Serial.print(Kp, 3);
-            Serial.print(F("  Ki="));            Serial.print(Ki, 4);
-            Serial.print(F("  Kd="));            Serial.print(Kd, 3);
-            Serial.print(F("  lfspeed="));       Serial.println(lfspeed);
+            Serial.print(F("[CAL] ESQ P="));
+            Serial.print(refPretoE.r); Serial.print(','); Serial.print(refPretoE.g); Serial.print(','); Serial.print(refPretoE.b);
+            Serial.print(F(" B="));
+            Serial.print(refBrancoE.r); Serial.print(','); Serial.print(refBrancoE.g); Serial.print(','); Serial.print(refBrancoE.b);
+            Serial.print(F(" V="));
+            Serial.print(refVerdeE.r); Serial.print(','); Serial.print(refVerdeE.g); Serial.print(','); Serial.println(refVerdeE.b);
+            Serial.print(F("[CAL] DIR P="));
+            Serial.print(refPretoD.r); Serial.print(','); Serial.print(refPretoD.g); Serial.print(','); Serial.print(refPretoD.b);
+            Serial.print(F(" B="));
+            Serial.print(refBrancoD.r); Serial.print(','); Serial.print(refBrancoD.g); Serial.print(','); Serial.print(refBrancoD.b);
+            Serial.print(F(" V="));
+            Serial.print(refVerdeD.r); Serial.print(','); Serial.print(refVerdeD.g); Serial.print(','); Serial.println(refVerdeD.b);
+            Serial.print(F("[CAL] N_HIST=")); Serial.print(N_HIST);
+            Serial.print(F("  Kp="));         Serial.print(Kp, 3);
+            Serial.print(F("  Ki="));         Serial.print(Ki, 4);
+            Serial.print(F("  Kd="));         Serial.print(Kd, 3);
+            Serial.print(F("  lfspeed="));    Serial.println(lfspeed);
             break;
         case 'i':
             Serial.print(F("[DBG] estado="));   Serial.print(estado);
@@ -619,24 +847,20 @@ void imprimirTelemetria() {
         Serial.print(sensorValues[i] >= QTR_PRETO ? '#' : '.');
     Serial.print(F("] "));
 
-    // TCS esquerdo
+    // TCS esquerdo (RGB)
     if (tcsEOk) {
         LeituraCor cE = lerCor(tcsE);
-        Serial.print(F("ESQ[g/c="));
-        Serial.print(cE.g, 2);
-        Serial.print(F(" C="));
-        Serial.print(cE.c);
-        Serial.print(ehVerde(cE) ? F(" VERDE]  ") : F(" -]  "));
+        Serial.print(F("ESQ["));
+        Serial.print(cE.r); Serial.print(','); Serial.print(cE.g); Serial.print(','); Serial.print(cE.b);
+        Serial.print(ehVerde(cE, refPretoE, refBrancoE, refVerdeE) ? F(" VERDE]  ") : F(" -]  "));
     }
 
-    // TCS direito
+    // TCS direito (RGB)
     if (tcsDOk) {
         LeituraCor cD = lerCor(tcsD);
-        Serial.print(F("DIR[g/c="));
-        Serial.print(cD.g, 2);
-        Serial.print(F(" C="));
-        Serial.print(cD.c);
-        Serial.print(ehVerde(cD) ? F(" VERDE]") : F(" -]"));
+        Serial.print(F("DIR["));
+        Serial.print(cD.r); Serial.print(','); Serial.print(cD.g); Serial.print(','); Serial.print(cD.b);
+        Serial.print(ehVerde(cD, refPretoD, refBrancoD, refVerdeD) ? F(" VERDE]") : F(" -]"));
     }
 
     Serial.println();
@@ -671,34 +895,36 @@ void bip(int n, int ms_on, int ms_off) {
  *    → Troque HIGH/LOW nos pinos AIN1/AIN2 (ou BIN1/BIN2) em
  *      moverFrente() e moverRe() até o robô andar pra frente.
  *
- *  PASSO 2 — CALIBRAÇÃO DE COR (via Monitor Serial 115200)
+ *  PASSO 2 — CALIBRAÇÃO DE COR RGB (via Monitor Serial 115200)
  *  ──────────────────────────────────────────────────────────
  *  Faça isso com o robô PARADO e os sensores de cor a ~5 mm do piso.
+ *  Cada comando captura os 3 canais RGB brutos e SALVA na flash (NVS),
+ *  então você só precisa calibrar UMA vez.
  *
- *  a) Posicione o TCS sobre a LINHA PRETA → envie 'p'
- *     Serial imprime: "[CAL] cPreto = XXX"
- *     Anote o valor.
+ *  a) Posicione o TCS sobre a LINHA PRETA  → envie 'p'
+ *     Serial imprime: "[CAL] PRETO  RGB=r,g,b"
  *
- *  b) Posicione o TCS sobre o PISO BRANCO → envie 'b'
- *     Serial imprime: "[CAL] cBranco = XXX"
- *     Anote o valor.
+ *  b) Posicione o TCS sobre o PISO BRANCO  → envie 'b'
+ *     Serial imprime: "[CAL] BRANCO RGB=r,g,b"
  *
- *  c) Posicione o TCS sobre o MARCADOR VERDE → envie 'v'
- *     Serial imprime: "[CAL] VERDE  r/c=0.XX  g/c=0.XX  b/c=0.XX  C=XXXX"
- *     O valor de g/c deve ser claramente maior que r/c e b/c.
- *     Copie o g/c e defina:
- *       GC_MIN = (g/c lido) × 0.85   ← margem de segurança de 15%
- *     Altere a linha:  float GC_MIN = ...;  no início do código.
+ *  c) Posicione o TCS sobre o MARCADOR VERDE → envie 'g'
+ *     Serial imprime: "[CAL] VERDE  RGB=r,g,b"  (G deve dominar R e B)
  *
- *  d) Envie 'c' para ver todos os parâmetros atuais.
- *     Se parecer certo (cPreto < cBranco, g/c do verde > GC_MIN): OK!
+ *  d) Envie 'v' para ler o RGB atual e ver a classificação:
+ *     "[CAL] Leitura RGB=r,g,b  C=XXXX  -> VERDE / nao-verde"
+ *     Confirme sobre cada cor que a classificação está correta.
  *
- *  Critérios de BOAS leituras de cor:
- *    • cPreto  deve ser pequeno (ex.: 50–400)
- *    • cBranco deve ser grande (ex.: 3000–8000)
- *    • g/c no verde  deve ser ≥ 0.40 e claramente > r/c e b/c
- *    • g/c no branco deve ser ≈ 0.33 (canais equilibrados)
- *    • g/c no preto  deve ser baixo e c < cPreto
+ *  e) Envie 'c' para ver as 3 referências salvas.
+ *
+ *  A classificação usa o VIZINHO MAIS PRÓXIMO: a cor lida é comparada
+ *  com as 3 referências e vence a de menor distância. Não há thresholds
+ *  manuais — basta calibrar bem as 3 cores. Se houver confusão entre
+ *  duas cores, recalibre a referência que estiver "puxando" errado.
+ *
+ *  Critérios de BOAS referências RGB:
+ *    • PRETO  → R, G, B todos baixos (ex.: < 100)
+ *    • BRANCO → R, G, B todos altos e equilibrados entre si
+ *    • VERDE  → G claramente maior que R e B
  *
  *  PASSO 3 — CALIBRAÇÃO DO GIRO (MPU6050)
  *  ────────────────────────────────────────
@@ -735,8 +961,10 @@ void bip(int n, int ms_on, int ms_off) {
  *     o robô passar sobre o marcador.
  *  c) O robô deve avançar, ver a interseção confirmada (X/5 pretos),
  *     recuar brevemente, girar 90° e reencontrar a linha.
- *  d) Se não detectar verde: diminua GC_MIN ou aproxime o sensor do piso.
- *  e) Se detectar falsos positivos (sem verde): aumente GC_MIN.
+ *  d) Se não detectar verde: recalibre o VERDE ('g') sobre o marcador,
+ *     ou aproxime o sensor do piso e refaça as 3 referências.
+ *  e) Se detectar falsos positivos: recalibre PRETO/BRANCO ('p'/'b')
+ *     para afastar essas referências do verde.
  *  f) Verifique o campo "pretos=X/5" via comando 'i' no Serial:
  *       • Interseção + (4 ramos), abordagem frontal:  espere 5/5
  *       • Interseção T, abordagem pelo CABO:          espere 5/5
